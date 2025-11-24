@@ -1,20 +1,8 @@
-# Use NVIDIA CUDA 12.6 base image with cuDNN
-FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu22.04
+# Use official PyTorch image with CUDA 12.4 (closest to 12.6)
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
 # Set working directory
 WORKDIR /app
-
-# Install Python 3.10 and system dependencies
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3.10-dev \
-    python3-pip \
-    git \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -s /usr/bin/python3.10 /usr/bin/python
-
-# Upgrade pip
-RUN pip install --upgrade pip
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
