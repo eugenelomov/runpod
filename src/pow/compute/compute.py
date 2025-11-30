@@ -61,6 +61,7 @@ class Compute(BaseCompute):
         r_target: float,
         devices: List[str],
         node_id: int,
+        base_model_data: dict = None,
     ):
         self.public_key = public_key
         self.block_hash = block_hash
@@ -70,13 +71,23 @@ class Compute(BaseCompute):
         self.stats = Stats()
         self.devices = devices
 
-        self.model = ModelWrapper.build(
-            hash_=self.block_hash,
-            params=params,
-            stats=self.stats.time_stats,
-            devices=self.devices,
-            max_seq_len=self.params.seq_len,
-        )
+        if base_model_data is not None:
+            # Use pre-built model via GPU→GPU copy (fast path)
+            # devices[0] should be single GPU like "cuda:0"
+            self.model = ModelWrapper.build_from_gpu_state_dict(
+                base_model_data=base_model_data,
+                stats=self.stats.time_stats,
+                target_device=self.devices[0],
+            )
+        else:
+            # Build model from scratch (slow path)
+            self.model = ModelWrapper.build(
+                hash_=self.block_hash,
+                params=params,
+                stats=self.stats.time_stats,
+                devices=self.devices,
+                max_seq_len=self.params.seq_len,
+            )
         self.target = get_target(
             self.block_hash,
             self.params.vocab_size

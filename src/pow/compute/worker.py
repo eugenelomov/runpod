@@ -52,10 +52,14 @@ def worker_thread(
     stop_event: threading.Event,
     ready_event: threading.Event,
     max_duration: float = 420.0,  # 7 minutes default
+    base_model_data: dict = None,  # Pre-built model state_dict for fast loading
 ):
     """
     Worker thread that runs on a specific GPU group.
     Generates nonces and puts results into result_queue.
+
+    If base_model_data is provided, uses fast path to load model from state_dict.
+    Otherwise, builds model from scratch (slow path).
     """
     import torch
 
@@ -63,6 +67,11 @@ def worker_thread(
         logger.info(f"[Worker {worker_id}] Starting on devices {devices}, batch_size={batch_size}")
 
         # Initialize compute for this worker's GPU(s)
+        if base_model_data is not None:
+            logger.info(f"[Worker {worker_id}] Creating Compute from pre-built model...")
+        else:
+            logger.info(f"[Worker {worker_id}] Creating Compute (building model from scratch)...")
+
         compute = Compute(
             params=params,
             block_hash=block_hash,
@@ -71,6 +80,7 @@ def worker_thread(
             r_target=r_target,
             devices=devices,
             node_id=worker_id,
+            base_model_data=base_model_data,
         )
 
         target = get_target(block_hash, params.vocab_size)
@@ -190,6 +200,7 @@ class ParallelWorkerManager:
         gpu_groups: List[List[str]],  # List of device lists per worker
         start_nonce: int = 0,
         max_duration: float = 420.0,
+        base_model_data: dict = None,  # Pre-built model for fast loading
     ):
         self.params = params
         self.block_hash = block_hash
@@ -201,6 +212,7 @@ class ParallelWorkerManager:
         self.start_nonce = start_nonce
         self.max_duration = max_duration
         self.n_workers = len(gpu_groups)
+        self.base_model_data = base_model_data
 
         self.result_queue = queue.Queue(maxsize=1000)
         self.stop_event = threading.Event()
@@ -230,6 +242,7 @@ class ParallelWorkerManager:
                     self.stop_event,
                     ready_event,
                     self.max_duration,
+                    self.base_model_data,  # Pass pre-built model
                 ),
                 daemon=True,
                 name=f"Worker-{worker_id}",

@@ -5,18 +5,46 @@ import logging
 from typing import Dict, Any, List
 
 import runpod
+import torch
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
+# Configure logging early
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize CUDA at module load time (before any handler calls)
+# This prevents race conditions in RunPod containers
+def _init_cuda():
+    """Initialize CUDA with retry logic for RunPod containers."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            if torch.cuda.is_available():
+                device_count = torch.cuda.device_count()
+                # Initialize primary GPU context
+                torch.cuda.set_device(0)
+                torch.cuda.empty_cache()
+                logger.info(f"CUDA initialized successfully with {device_count} GPUs")
+                return True
+            else:
+                logger.warning(f"CUDA not available on attempt {attempt + 1}/{max_retries}")
+                time.sleep(1)
+        except Exception as e:
+            logger.warning(f"CUDA init error on attempt {attempt + 1}: {e}")
+            time.sleep(1)
+    logger.error("Failed to initialize CUDA after all retries")
+    return False
+
+# Run CUDA initialization
+_cuda_ready = _init_cuda()
+
 from pow.compute.gpu_group import create_gpu_groups, GpuGroup
 from pow.compute.autobs_v2 import get_batch_size_for_gpu_group
 from pow.compute.worker import ParallelWorkerManager
+from pow.compute.model_init import ModelWrapper
 from pow.models.utils import Params
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Maximum job duration: 7 minutes
 MAX_JOB_DURATION = 7 * 60
@@ -72,8 +100,11 @@ def handler(event: Dict[str, Any]):
 
         params = Params(**params_dict)
 
+        # Check CUDA initialization
+        if not _cuda_ready:
+            raise RuntimeError("CUDA initialization failed - no GPU support available")
+
         # Auto-detect GPUs and create groups
-        import torch
         gpu_count = torch.cuda.device_count()
         logger.info(f"Detected {gpu_count} GPUs")
 
@@ -104,7 +135,17 @@ def handler(event: Dict[str, Any]):
         # Convert GPU groups to device string lists
         gpu_group_devices = [group.get_device_strings() for group in gpu_groups]
 
-        # Create and start parallel worker manager
+        # Build base model ONCE on GPU 0 (this is the slow part)
+        logger.info("Building base model on GPU 0...")
+        base_model_start = time.time()
+        base_model_data = ModelWrapper.build_base_model(
+            hash_=block_hash,
+            params=params,
+            max_seq_len=params.seq_len,
+        )
+        logger.info(f"Base model built in {time.time() - base_model_start:.1f}s")
+
+        # Create and start parallel worker manager with pre-built model
         manager = ParallelWorkerManager(
             params=params,
             block_hash=block_hash,
@@ -115,6 +156,7 @@ def handler(event: Dict[str, Any]):
             gpu_groups=gpu_group_devices,
             start_nonce=start_nonce,
             max_duration=MAX_JOB_DURATION,
+            base_model_data=base_model_data,  # Pass pre-built model to all workers
         )
 
         manager.start()
@@ -187,10 +229,20 @@ def handler(event: Dict[str, Any]):
         logger.info(f"STOPPED: {aggregated_batch_count} batches, {total_computed} computed, {total_valid} valid")
         manager.stop()
 
+        # Free GPU 0 memory - delete base model data after all workers done
+        logger.info("Freeing GPU 0 memory...")
+        del base_model_data
+        torch.cuda.empty_cache()
+
     except GeneratorExit:
         logger.info(f"CANCELLED: {aggregated_batch_count} batches, {total_computed} computed, {total_valid} valid")
         try:
             manager.stop()
+        except:
+            pass
+        try:
+            del base_model_data
+            torch.cuda.empty_cache()
         except:
             pass
     except Exception as e:
@@ -201,6 +253,11 @@ def handler(event: Dict[str, Any]):
         }
         try:
             manager.stop()
+        except:
+            pass
+        try:
+            del base_model_data
+            torch.cuda.empty_cache()
         except:
             pass
 
