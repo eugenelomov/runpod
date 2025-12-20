@@ -67,7 +67,7 @@ def get_gpu_architecture(device_id: int = 0) -> GPUCapabilities:
 
     # Determine architecture from compute capability
     if cc[0] >= 10:
-        # Blackwell: SM100 (B200) or SM103 (B300)
+        # Blackwell: SM100 (B200), SM103 (B300), SM120 (RTX PRO 6000)
         arch = GPUArchitecture.BLACKWELL
         supports_fp8 = True
         supports_fp6 = True   # Blackwell 5th gen tensor cores
@@ -76,11 +76,17 @@ def get_gpu_architecture(device_id: int = 0) -> GPUCapabilities:
         supports_flash_attention = True
         recommended_dtype = torch.bfloat16
 
-        # B200 has 180GB HBM3e - can handle larger batches
-        if total_memory_gb > 150:
-            max_batch_multiplier = 2.0  # B200 (180GB)
+        # Detect workstation vs datacenter GPU
+        is_workstation = "RTX" in device_name.upper() or cc[1] >= 20  # SM120+ = workstation
+
+        if is_workstation:
+            # RTX PRO 6000 and similar workstation GPUs
+            # Lower memory bandwidth than datacenter GPUs, need smaller batches
+            max_batch_multiplier = 0.5  # Target ~200 batch size
+        elif total_memory_gb > 150:
+            max_batch_multiplier = 2.0  # B200 (180GB HBM3e)
         else:
-            max_batch_multiplier = 1.5
+            max_batch_multiplier = 1.5  # Other datacenter Blackwell
 
     elif cc[0] == 9:
         # Hopper: SM90 (H100, H200)
@@ -235,15 +241,31 @@ def get_architecture_config(device_id: int = 0) -> Dict[str, Any]:
     caps = get_gpu_architecture(device_id)
 
     if caps.architecture == GPUArchitecture.BLACKWELL:
-        return {
-            "dtype": torch.bfloat16,
-            "use_flash_attention": True,
-            "use_torch_compile": True,  # Triton 3.3 supports Blackwell
-            "use_fp8": True,
-            "batch_size_multiplier": caps.max_batch_multiplier,
-            "target_memory_usage": 0.95,  # Blackwell TMEM allows higher usage
-            "activation_overhead_factor": 6.0,  # Optimized for 5th gen tensor cores
-        }
+        # Detect workstation vs datacenter
+        is_workstation = "RTX" in caps.device_name.upper() or caps.compute_capability[1] >= 20
+
+        if is_workstation:
+            # RTX PRO 6000 and similar - lower bandwidth, more conservative settings
+            return {
+                "dtype": torch.bfloat16,
+                "use_flash_attention": True,
+                "use_torch_compile": True,
+                "use_fp8": True,
+                "batch_size_multiplier": caps.max_batch_multiplier,  # 0.5
+                "target_memory_usage": 0.85,  # More conservative for workstation
+                "activation_overhead_factor": 8.0,  # Same as Hopper
+            }
+        else:
+            # B200 and datacenter GPUs - high bandwidth HBM3e
+            return {
+                "dtype": torch.bfloat16,
+                "use_flash_attention": True,
+                "use_torch_compile": True,  # Triton 3.3 supports Blackwell
+                "use_fp8": True,
+                "batch_size_multiplier": caps.max_batch_multiplier,
+                "target_memory_usage": 0.95,  # Blackwell TMEM allows higher usage
+                "activation_overhead_factor": 6.0,  # Optimized for 5th gen tensor cores
+            }
     elif caps.architecture == GPUArchitecture.HOPPER:
         return {
             "dtype": torch.bfloat16,
